@@ -1,0 +1,320 @@
+import os
+import sys
+import math
+import random
+import pygame
+
+WIDTH, HEIGHT = 1000, 700
+FPS = 60
+
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+ROAD = (60, 60, 60)
+GRASS = (40, 110, 40)
+STRIPE = (210, 210, 210)
+CONE = (255, 140, 0)
+
+MAX_SPEED = 8.0
+ACCEL = 0.18
+BRAKE = 0.28
+FRICTION = 0.06
+TURN_RATE = 0.055
+
+TRACK_WIDTH = 150
+CAR_SIZE = (60, 60)
+CAR_ROTATION_OFFSET = math.pi / 2
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+def angle_to(a, b):
+    return math.atan2(b[1] - a[1], b[0] - a[0])
+
+def wrap_angle(theta):
+    while theta <= -math.pi:
+        theta += 2 * math.pi
+    while theta > math.pi:
+        theta -= 2 * math.pi
+    return theta
+
+def load_random_car_sprites(size, count=3):
+    base_dir = os.path.dirname(__file__)
+    cars_dir = os.path.join(base_dir, "Cars")
+    if not os.path.exists(cars_dir):
+        return [None] * count
+    png_files = []
+    for file in os.listdir(cars_dir):
+        full_path = os.path.join(cars_dir, file)
+        if os.path.isfile(full_path) and file.lower().endswith(".png"):
+            png_files.append(full_path)
+    if len(png_files) == 0:
+        return [None] * count
+    random.shuffle(png_files)
+    selected = png_files[:count]
+    sprites = []
+    for path in selected:
+        try:
+            img = pygame.image.load(path).convert_alpha()
+            img = pygame.transform.smoothscale(img, size)
+            sprites.append(img)
+        except:
+            sprites.append(None)
+    while len(sprites) < count:
+        sprites.append(None)
+    return sprites
+
+def draw_car_sprite(screen, img, x, y, angle_radians):
+    angle_degrees = -math.degrees(angle_radians)
+    rotated = pygame.transform.rotate(img, angle_degrees)
+    rect = rotated.get_rect(center=(x, y))
+    screen.blit(rotated, rect)
+
+def make_track():
+    return [
+        (160, 520), (220, 580), (340, 620), (520, 610),
+        (700, 560), (820, 460), (860, 320), (800, 180),
+        (650, 110), (480, 120), (340, 160), (240, 250),
+        (210, 360), (220, 460)
+    ]
+
+TRACK = make_track()
+
+def point_segment_distance(px, py, ax, ay, bx, by):
+    abx, aby = bx - ax, by - ay
+    apx, apy = px - ax, py - ay
+    ab_len2 = abx * abx + aby * aby
+    if ab_len2 == 0:
+        return math.hypot(px - ax, py - ay)
+    t = (apx * abx + apy * aby) / ab_len2
+    t = clamp(t, 0.0, 1.0)
+    cx = ax + t * abx
+    cy = ay + t * aby
+    return math.hypot(px - cx, py - cy)
+
+def get_track_direction(x, y):
+    closest_dist = 1e9
+    best_angle = 0
+    for i in range(len(TRACK)):
+        ax, ay = TRACK[i]
+        bx, by = TRACK[(i + 1) % len(TRACK)]
+        d = point_segment_distance(x, y, ax, ay, bx, by)
+        if d < closest_dist:
+            closest_dist = d
+            best_angle = math.atan2(by - ay, bx - ax)
+    return best_angle
+
+def distance_to_track(x, y):
+    best = 1e9
+    for i in range(len(TRACK)):
+        a = TRACK[i]
+        b = TRACK[(i + 1) % len(TRACK)]
+        best = min(best, point_segment_distance(x, y, a[0], a[1], b[0], b[1]))
+    return best
+
+def on_road(x, y):
+    return distance_to_track(x, y) <= TRACK_WIDTH / 2
+
+class Obstacle:
+    def __init__(self, x, y, r=16):
+        self.x = x
+        self.y = y
+        self.r = r
+    def rect(self):
+        return pygame.Rect(self.x - self.r, self.y - self.r, self.r * 2, self.r * 2)
+    def draw(self, screen):
+        pygame.draw.circle(screen, CONE, (self.x, self.y), self.r)
+        pygame.draw.circle(screen, BLACK, (self.x, self.y), self.r, 2)
+
+def hit_obstacle(car_rect, obs):
+    return car_rect.colliderect(obs.rect())
+
+class Car:
+    def __init__(self, x, y, color, sprite=None):
+        self.x = float(x)
+        self.y = float(y)
+        self.angle = -math.pi / 2
+        self.speed = 0.0
+        self.color = color
+        self.sprite = sprite
+        self.w, self.h = 24, 40
+    def rect(self):
+        return pygame.Rect(int(self.x - self.w / 2), int(self.y - self.h / 2), self.w, self.h)
+    def update_physics(self, steering_input=0.0):
+        if self.speed > 0:
+            self.speed = max(0.0, self.speed - FRICTION)
+        elif self.speed < 0:
+            self.speed = min(0.0, self.speed + FRICTION)
+        target_angle = get_track_direction(self.x, self.y)
+        angle_diff = wrap_angle(target_angle - self.angle)
+        self.angle += angle_diff * 0.05 + steering_input
+        self.x += math.cos(self.angle) * self.speed
+        self.y += math.sin(self.angle) * self.speed
+        self.x = clamp(self.x, 20, WIDTH - 20)
+        self.y = clamp(self.y, 20, HEIGHT - 20)
+        if not on_road(self.x, self.y):
+            self.speed *= 0.93
+    def draw(self, screen):
+        if self.sprite is not None:
+            draw_car_sprite(screen, self.sprite, self.x, self.y, self.angle + CAR_ROTATION_OFFSET)
+        else:
+            ca, sa = math.cos(self.angle + CAR_ROTATION_OFFSET), math.sin(self.angle + CAR_ROTATION_OFFSET)
+            w, h = 26, 44
+            hw, hh = w / 2, h / 2
+            corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+            pts = []
+            for cx, cy in corners:
+                rx = cx * ca - cy * sa
+                ry = cx * sa + cy * ca
+                pts.append((self.x + rx, self.y + ry))
+            pygame.draw.polygon(screen, self.color, pts)
+            pygame.draw.line(screen, BLACK, (self.x, self.y), (self.x + ca * 18, self.y + sa * 18), 3)
+
+class AICar(Car):
+    def __init__(self, x, y, color, waypoints, sprite=None):
+        super().__init__(x, y, color, sprite=sprite)
+        self.waypoints = waypoints
+        self.target_i = 0
+        self.max_ai_speed = random.uniform(5.5, 7.5)
+    def update_ai(self):
+        target = self.waypoints[self.target_i]
+        desired = angle_to((self.x, self.y), target)
+        delta = wrap_angle(desired - self.angle)
+        steer = clamp(delta, -0.08, 0.08)
+        self.angle += steer
+        turn_penalty = 1.0 - min(0.45, abs(delta))
+        target_speed = self.max_ai_speed * turn_penalty
+        if self.speed < target_speed:
+            self.speed += ACCEL * 0.9
+        else:
+            self.speed -= BRAKE * 0.35
+        self.speed = clamp(self.speed, 0.0, self.max_ai_speed)
+        if dist((self.x, self.y), target) < 35:
+            self.target_i = (self.target_i + 1) % len(self.waypoints)
+
+def draw_world(screen):
+    screen.fill(GRASS)
+    for y in range(0, HEIGHT, 24):
+        pygame.draw.line(screen, (35, 100, 35), (0, y), (WIDTH, y), 1)
+    pygame.draw.lines(screen, ROAD, True, TRACK, TRACK_WIDTH)
+    for i in range(len(TRACK)):
+        a = TRACK[i]
+        b = TRACK[(i + 1) % len(TRACK)]
+        seg_len = int(dist(a, b))
+        if seg_len <= 0:
+            continue
+        steps = max(1, seg_len // 30)
+        for s in range(steps):
+            t1 = (s * 30) / seg_len
+            t2 = ((s * 30) + 14) / seg_len
+            if t2 > 1:
+                break
+            x1 = a[0] + (b[0] - a[0]) * t1
+            y1 = a[1] + (b[1] - a[1]) * t1
+            x2 = a[0] + (b[0] - a[0]) * t2
+            y2 = a[1] + (b[1] - a[1]) * t2
+            pygame.draw.line(screen, STRIPE, (x1, y1), (x2, y2), 4)
+
+def draw_text(screen, msg, x, y, size=24, color=WHITE):
+    font = pygame.font.SysFont("arial", size, bold=True)
+    screen.blit(font.render(msg, True, color), (x, y))
+
+def build_obstacles(n=10):
+    obs = []
+    for _ in range(n):
+        for _ in range(200):
+            x = random.randint(100, WIDTH - 100)
+            y = random.randint(100, HEIGHT - 100)
+            if on_road(x, y):
+                obs.append(Obstacle(x, y, r=random.randint(12, 18)))
+                break
+    return obs
+
+def reset_game():
+    sprites = load_random_car_sprites(CAR_SIZE, 3)
+    player = Car(TRACK[0][0], TRACK[0][1] + 40, (30, 30, 220), sprite=sprites[0])
+    ai_cars = [
+        AICar(TRACK[0][0] + 35, TRACK[0][1] + 70, (220, 30, 30), TRACK, sprite=sprites[1]),
+        AICar(TRACK[0][0] - 35, TRACK[0][1] + 70, (220, 160, 30), TRACK, sprite=sprites[2]),
+    ]
+    obstacles = build_obstacles(10)
+    return player, ai_cars, obstacles, False, 1
+
+def progress_metric_for(car):
+    if isinstance(car, AICar):
+        ti = car.target_i
+        target = TRACK[ti]
+    else:
+        ti = min(range(len(TRACK)), key=lambda i: dist((car.x, car.y), TRACK[i]))
+        target = TRACK[ti]
+    return ti * 10000 - dist((car.x, car.y), target)
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Campus Circuit — Sprite Racer")
+    clock = pygame.time.Clock()
+    player, ai_cars, obstacles, game_over, player_place = reset_game()
+
+    while True:
+        clock.tick(FPS)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if game_over and event.key == pygame.K_r:
+                    player, ai_cars, obstacles, game_over, player_place = reset_game()
+
+        keys = pygame.key.get_pressed()
+        if not game_over:
+            if keys[pygame.K_UP]:
+                player.speed += ACCEL
+            if keys[pygame.K_DOWN]:
+                player.speed -= BRAKE
+            player.speed = clamp(player.speed, -3.0, MAX_SPEED)
+
+            steer_strength = TURN_RATE * (0.4 + 0.6 * min(1.0, abs(player.speed) / MAX_SPEED))
+            steering_input = 0.0
+            if keys[pygame.K_LEFT]:
+                steering_input -= steer_strength
+            if keys[pygame.K_RIGHT]:
+                steering_input += steer_strength
+
+            player.update_physics(steering_input=steering_input)
+
+            for ai in ai_cars:
+                ai.update_ai()
+                ai.update_physics()
+
+            for obs in obstacles:
+                if hit_obstacle(player.rect(), obs):
+                    player.speed *= 0.6
+                for ai in ai_cars:
+                    if hit_obstacle(ai.rect(), obs):
+                        ai.speed *= 0.7
+
+            metrics = [("player", progress_metric_for(player))]
+            for i, ai in enumerate(ai_cars):
+                metrics.append((f"ai{i}", progress_metric_for(ai)))
+            metrics.sort(key=lambda t: t[1], reverse=True)
+            player_place = 1 + [name for name, _ in metrics].index("player")
+
+        draw_world(screen)
+        for obs in obstacles:
+            obs.draw(screen)
+        for ai in ai_cars:
+            ai.draw(screen)
+        player.draw(screen)
+
+        draw_text(screen, f"Speed: {player.speed:.1f}", 18, 14, 24)
+        draw_text(screen, f"Place: {player_place}/{1 + len(ai_cars)}", 18, 42, 24)
+        draw_text(screen, "Controls: Arrow Keys | R = Restart", 18, 70, 20)
+        if game_over:
+            draw_text(screen, "CRASHED OUT! Press R to Restart", 250, 320, 34)
+        pygame.display.flip()
+
+if __name__ == "__main__":
+    main()
