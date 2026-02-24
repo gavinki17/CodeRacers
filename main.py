@@ -1,0 +1,358 @@
+import os
+import sys
+import math
+import random
+import pygame
+
+SCREEN_WIDTH, SCREEN_HEIGHT = 1000, 700
+WORLD_WIDTH, WORLD_HEIGHT = 2600, 1800
+FPS = 60
+
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+ROAD = (60, 60, 60)
+GRASS = (40, 110, 40)
+STRIPE = (220, 220, 220)
+CONE = (255, 140, 0)
+
+MAX_SPEED = 9.0
+ACCEL = 0.25
+BRAKE = 0.35
+FRICTION = 0.05
+TURN_RATE = 0.06
+
+TRACK_WIDTH = 360
+LANES = 3
+LANE_WIDTH = TRACK_WIDTH / LANES
+CAR_SIZE = (60, 60)
+CAR_ROTATION_OFFSET = math.pi / 2
+LAPS_TOTAL = 5
+SPIN_DURATION = 3.0
+
+def clamp(x, lo, hi): return max(lo, min(hi, x))
+def wrap_angle(theta):
+    while theta <= -math.pi: theta += 2*math.pi
+    while theta > math.pi: theta -= 2*math.pi
+    return theta
+def dist(a,b): return math.hypot(a[0]-b[0],a[1]-b[1])
+def angle_to(a,b): return math.atan2(b[1]-a[1],b[0]-a[0])
+
+def load_random_car_sprites(size,count):
+    base_dir = os.path.dirname(__file__)
+    cars_dir = os.path.join(base_dir, "Cars")
+    if not os.path.exists(cars_dir): return [None]*count
+    png_files = [os.path.join(cars_dir,f) for f in os.listdir(cars_dir) if f.lower().endswith(".png")]
+    random.shuffle(png_files)
+    sprites=[]
+    for path in png_files[:count]:
+        try:
+            img = pygame.image.load(path).convert_alpha()
+            img = pygame.transform.smoothscale(img,size)
+            sprites.append(img)
+        except: sprites.append(None)
+    while len(sprites)<count: sprites.append(None)
+    return sprites
+
+def draw_car_sprite(screen,img,x,y,angle_radians):
+    angle_degrees = -math.degrees(angle_radians)
+    rotated = pygame.transform.rotate(img,angle_degrees)
+    rect = rotated.get_rect(center=(x,y))
+    screen.blit(rotated,rect)
+
+def make_track():
+    cx,cy = WORLD_WIDTH//2,WORLD_HEIGHT//2
+    rx,ry = 900,600
+    pts=[]
+    for i in range(240):
+        t=(i/240)*2*math.pi
+        pts.append((cx+math.cos(t)*rx,cy+math.sin(t)*ry))
+    return pts
+
+TRACK = make_track()
+
+def closest_point_on_track(px,py):
+    best_dist=1e9
+    best_point=(px,py)
+    best_angle=0
+    best_idx=0
+    for i in range(len(TRACK)):
+        ax,ay=TRACK[i]
+        bx,by=TRACK[(i+1)%len(TRACK)]
+        abx,aby=bx-ax,by-ay
+        ab_len2=abx*abx+aby*aby
+        if ab_len2==0: continue
+        t=((px-ax)*abx+(py-ay)*aby)/ab_len2
+        t=clamp(t,0.0,1.0)
+        cx=ax+t*abx
+        cy=ay+t*aby
+        d=math.hypot(px-cx,py-cy)
+        if d<best_dist:
+            best_dist=d
+            best_point=(cx,cy)
+            best_angle=math.atan2(by-ay,bx-ax)
+            best_idx=i
+    return best_point,best_dist,best_angle,best_idx
+
+def get_track_direction(x,y): return closest_point_on_track(x,y)[2]
+
+class Obstacle:
+    def __init__(self,x,y,r=14):
+        self.x=x
+        self.y=y
+        self.r=r
+    def draw(self,screen,camera):
+        sx=self.x-camera[0]
+        sy=self.y-camera[1]
+        pygame.draw.circle(screen,CONE,(int(sx),int(sy)),self.r)
+        pygame.draw.circle(screen,BLACK,(int(sx),int(sy)),self.r,2)
+
+class SkidMark:
+    def __init__(self, x, y, angle):
+        self.x = x
+        self.y = y
+        self.angle = angle
+        self.timer = 1.0
+    def update(self, dt):
+        self.timer -= dt
+    def draw(self, screen, camera):
+        if self.timer <= 0: return
+        sx = self.x - camera[0]
+        sy = self.y - camera[1]
+        length = 10
+        dx = math.cos(self.angle) * length
+        dy = math.sin(self.angle) * length
+        alpha = int(255 * self.timer)
+        surf = pygame.Surface((length*2,4), pygame.SRCALPHA)
+        pygame.draw.line(surf, (50,50,50,alpha), (0,2),(length*2,2), 3)
+        rotated = pygame.transform.rotate(surf, -math.degrees(self.angle))
+        rect = rotated.get_rect(center=(sx,sy))
+        screen.blit(rotated, rect)
+
+def build_cones(count=60):
+    cones=[]
+    for _ in range(count):
+        idx=random.randint(0,len(TRACK)-1)
+        base=TRACK[idx]
+        ang=get_track_direction(base[0],base[1])
+        nx,ny=-math.sin(ang),math.cos(ang)
+        side=random.choice([-1,1])
+        offset=random.uniform(TRACK_WIDTH/2-40,TRACK_WIDTH/2-10)
+        x=base[0]+nx*offset*side
+        y=base[1]+ny*offset*side
+        cones.append(Obstacle(x,y))
+    return cones
+
+class Car:
+    def __init__(self,x,y,sprite=None):
+        self.x=float(x)
+        self.y=float(y)
+        self.angle=get_track_direction(x,y)
+        self.speed=0.0
+        self.sprite=sprite
+        self.w,self.h=26,46
+        self.lap=0
+        self.last_idx=0
+        self.spin_timer=0
+    def update_physics(self,steer=0.0):
+        if self.spin_timer>0:
+            self.spin_timer-=1/FPS
+            self.speed*=0.95
+            self.angle+=0.1
+            self.x+=math.cos(self.angle)*self.speed
+            self.y+=math.sin(self.angle)*self.speed
+            return
+        if self.speed>0:self.speed=max(0.0,self.speed-FRICTION)
+        elif self.speed<0:self.speed=min(0.0,self.speed+FRICTION)
+        target_angle=get_track_direction(self.x,self.y)
+        diff=wrap_angle(target_angle-self.angle)
+        self.angle+=diff*0.05+steer
+        self.x+=math.cos(self.angle)*self.speed
+        self.y+=math.sin(self.angle)*self.speed
+        closest,d,_,idx=closest_point_on_track(self.x,self.y)
+        if d>TRACK_WIDTH/2:
+            nx=self.x-closest[0]
+            ny=self.y-closest[1]
+            l=math.hypot(nx,ny)
+            if l!=0:
+                nx/=l; ny/=l
+                self.x=closest[0]+nx*TRACK_WIDTH/2
+                self.y=closest[1]+ny*TRACK_WIDTH/2
+            self.speed*=0.4
+        if idx<self.last_idx: self.lap+=1
+        self.last_idx=idx
+    def draw(self,screen,camera):
+        sx=self.x-camera[0]
+        sy=self.y-camera[1]
+        if self.sprite: draw_car_sprite(screen,self.sprite,sx,sy,self.angle+CAR_ROTATION_OFFSET)
+        else: pygame.draw.rect(screen,(200,0,0),(sx-12,sy-20,24,40))
+
+class AICar(Car):
+    def __init__(self,x,y,sprite=None):
+        super().__init__(x,y,sprite)
+        self.max_speed=random.uniform(6.5,8.5)
+        self.target_i=0
+    def update_ai(self):
+        target=TRACK[self.target_i]
+        desired=angle_to((self.x,self.y),target)
+        delta=wrap_angle(desired-self.angle)
+        steer=clamp(delta,-0.08,0.08)
+        self.angle+=steer
+        turn_penalty=1.0 - min(0.45,abs(delta))
+        target_speed=self.max_speed*turn_penalty
+        if self.speed<target_speed:self.speed+=ACCEL*0.9
+        else:self.speed-=BRAKE*0.35
+        self.speed=clamp(self.speed,0.0,self.max_speed)
+        if dist((self.x,self.y),target)<35:
+            self.target_i=(self.target_i+1)%len(TRACK)
+
+def draw_world(screen,camera):
+    screen.fill(GRASS)
+    left=[]; right=[]
+    for i in range(len(TRACK)):
+        p_prev=TRACK[i-1]; p=TRACK[i]
+        ang=math.atan2(p[1]-p_prev[1],p[0]-p_prev[0])
+        nx,ny=-math.sin(ang),math.cos(ang)
+        left.append((p[0]+nx*TRACK_WIDTH/2-camera[0],p[1]+ny*TRACK_WIDTH/2-camera[1]))
+        right.append((p[0]-nx*TRACK_WIDTH/2-camera[0],p[1]-ny*TRACK_WIDTH/2-camera[1]))
+    pygame.draw.polygon(screen,ROAD,left+right[::-1])
+    pygame.draw.lines(screen,WHITE,True,left,4)
+    pygame.draw.lines(screen,WHITE,True,right,4)
+    for lane in range(1,LANES):
+        pts=[]
+        offset=TRACK_WIDTH/2-lane*LANE_WIDTH
+        for i in range(len(TRACK)):
+            p_prev=TRACK[i-1]; p=TRACK[i]
+            ang=math.atan2(p[1]-p_prev[1],p[0]-p_prev[0])
+            nx,ny=-math.sin(ang),math.cos(ang)
+            pts.append((p[0]-nx*offset-camera[0],p[1]-ny*offset-camera[1]))
+        for i in range(len(pts)-1):
+            if i%2==0: pygame.draw.line(screen,STRIPE,pts[i],pts[i+1],3)
+
+def draw_finish_line(screen, camera):
+    p0 = TRACK[0]
+    p1 = TRACK[1]
+    ang = math.atan2(p1[1]-p0[1], p1[0]-p0[0])
+    nx, ny = -math.sin(ang), math.cos(ang)
+    squares_across = int(TRACK_WIDTH / 40)
+    square_size = 40
+    for i in range(squares_across):
+        color = WHITE if i % 2 == 0 else BLACK
+        offset = -TRACK_WIDTH/2 + i * square_size
+        x0 = p0[0] + nx * offset
+        y0 = p0[1] + ny * offset
+        rect = [
+            (x0 - camera[0], y0 - camera[1]),
+            (x0 + nx * square_size - camera[0], y0 + ny * square_size - camera[1]),
+            (x0 + nx * square_size + math.cos(ang) * square_size - camera[0],
+             y0 + ny * square_size + math.sin(ang) * square_size - camera[1]),
+            (x0 + math.cos(ang) * square_size - camera[0], y0 + math.sin(ang) * square_size - camera[1])
+        ]
+        pygame.draw.polygon(screen, color, rect)
+
+def spawn_cars(sprites):
+    cars=[]
+    start=TRACK[0]
+    ang=get_track_direction(start[0],start[1])
+    nx,ny=-math.sin(ang),math.cos(ang)
+    back=-140
+    spacing_back=80
+    spacing_side=LANE_WIDTH*0.9
+    positions=[]
+    for row in range(4):
+        for col in range(2):
+            if len(positions)>=7: break
+            side = (-0.5 if col==0 else 0.5)*spacing_side
+            x=start[0]+math.cos(ang)*(back-row*spacing_back)+nx*side
+            y=start[1]+math.sin(ang)*(back-row*spacing_back)+ny*side
+            positions.append((x,y))
+    for i,pos in enumerate(positions):
+        x,y=pos
+        if i==0: cars.append(Car(x,y,sprites[i]))
+        else: cars.append(AICar(x,y,sprites[i]))
+    return cars
+
+def handle_collisions(cars, cones, skid_marks, dt):
+    for car in cars:
+        for cone in cones:
+            if dist((car.x,car.y),(cone.x,cone.y))<car.w/2+cone.r:
+                ang = math.atan2(car.y-cone.y, car.x-cone.x)
+                car.x += math.cos(ang) * 10
+                car.y += math.sin(ang) * 10
+                car.speed *= 0.6
+                skid_marks.append(SkidMark(car.x, car.y, car.angle))
+        for other in cars:
+            if car == other: continue
+            if dist((car.x,car.y),(other.x,other.y)) < car.w:
+                ang = math.atan2(car.y-other.y, car.x-other.x)
+                car.x += math.cos(ang) * 15
+                car.y += math.sin(ang) * 15
+                other.x -= math.cos(ang) * 15
+                other.y -= math.sin(ang) * 15
+                car.speed *= 0.5
+                other.speed *= 0.5
+                skid_marks.append(SkidMark(car.x, car.y, car.angle))
+                skid_marks.append(SkidMark(other.x, other.y, other.angle))
+
+def main():
+    pygame.init()
+    screen=pygame.display.set_mode((SCREEN_WIDTH,SCREEN_HEIGHT))
+    clock=pygame.time.Clock()
+    font_large=pygame.font.SysFont("arial",120)
+    font_small=pygame.font.SysFont("arial",32)
+    sprites=load_random_car_sprites(CAR_SIZE,7)
+    cars=spawn_cars(sprites)
+    player=cars[0]
+    cones=build_cones(60)
+    skid_marks=[]
+    start_ticks=pygame.time.get_ticks()
+    race_started=False
+    won=False
+    while True:
+        dt=clock.tick(FPS)
+        for mark in skid_marks[:]:
+            mark.update(dt/1000)
+            if mark.timer <= 0:
+                skid_marks.remove(mark)
+        for event in pygame.event.get():
+            if event.type==pygame.QUIT: pygame.quit(); sys.exit()
+        elapsed=(pygame.time.get_ticks()-start_ticks)/1000
+        if elapsed>=3: race_started=True
+        keys=pygame.key.get_pressed()
+        if race_started:
+            if keys[pygame.K_UP]: player.speed+=ACCEL
+            if keys[pygame.K_DOWN]: player.speed-=BRAKE
+        player.speed=clamp(player.speed,-3.0,MAX_SPEED)
+        steer=0
+        if keys[pygame.K_LEFT]: steer-=TURN_RATE
+        if keys[pygame.K_RIGHT]: steer+=TURN_RATE
+        if race_started:
+            player.update_physics(steer)
+            for ai in cars[1:]:
+                ai.update_ai()
+                ai.update_physics()
+        handle_collisions(cars,cones,skid_marks, dt/1000)
+        camera_x=clamp(player.x-SCREEN_WIDTH//2,0,WORLD_WIDTH-SCREEN_WIDTH)
+        camera_y=clamp(player.y-SCREEN_HEIGHT//2,0,WORLD_HEIGHT-SCREEN_HEIGHT)
+        camera=(camera_x,camera_y)
+        draw_world(screen,camera)
+        draw_finish_line(screen,camera)
+        for mark in skid_marks: mark.draw(screen, camera)
+        for cone in cones: cone.draw(screen,camera)
+        for car in cars: car.draw(screen,camera)
+        spd_text=font_small.render(f"Speed: {player.speed:.1f}",True,WHITE)
+        lap_text=font_small.render(f"Lap: {player.lap}/{LAPS_TOTAL}",True,WHITE)
+        screen.blit(spd_text,(20,20))
+        screen.blit(lap_text,(20,50))
+        if not race_started:
+            num=3-int(elapsed)
+            text=font_large.render(str(num) if num>0 else "GO",True,WHITE)
+            screen.blit(text,text.get_rect(center=(SCREEN_WIDTH//2,SCREEN_HEIGHT//2)))
+        if player.lap>=LAPS_TOTAL and not won:
+            won=True
+        if won:
+            text=font_large.render("YOU WON!",True,WHITE)
+            screen.blit(text,text.get_rect(center=(SCREEN_WIDTH//2,SCREEN_HEIGHT//2)))
+        pygame.display.flip()
+
+if __name__=="__main__":
+    main()
